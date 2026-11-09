@@ -36,7 +36,7 @@ COLUMNS = [
     "ISRC", "UPC",
     "Composition (Composer/Writer)", "Lyrics (Lyricist)",
     "Production (Producer)", "Engineering (Recording/Mix/Mastering)",
-    "Explicit", "Spotify URI",
+    "Credits Status", "Explicit", "Spotify URI",
 ]
 
 _URL_RE = re.compile(
@@ -147,22 +147,36 @@ _LYRICS = {"lyricist", "librettist"}
 _PRODUCTION = {"producer", "co-producer", "executive producer", "vocal producer"}
 _ENGINEERING = {"engineer", "recording", "mix", "mixer", "mastering", "sound",
                 "audio", "balance", "programming", "field recording"}
-_mb_cache: dict[str, dict[str, str]] = {}
+_INC = "artist-rels+work-rels+work-level-rels"
+_mb_cache: dict[str, tuple[dict[str, str], str]] = {}
 _mb_last = 0.0
 
 
-def _mb_get(path: str, params: dict) -> dict | None:
+def _mb_get(path: str, params: dict, retries: int = 3) -> tuple[dict | None, str]:
+    """GET from MusicBrainz. Returns (json_or_None, status)."""
     global _mb_last
-    wait = 1.1 - (time.time() - _mb_last)
-    if wait > 0:
-        time.sleep(wait)
-    _mb_last = time.time()
-    try:
-        r = requests.get(f"{MB_API}{path}", params={**params, "fmt": "json"},
-                         headers={"User-Agent": MB_UA}, timeout=20)
-        return r.json() if r.ok else None
-    except (requests.RequestException, ValueError):
-        return None
+    for attempt in range(retries):
+        wait = 1.1 - (time.time() - _mb_last)
+        if wait > 0:
+            time.sleep(wait)
+        _mb_last = time.time()
+        try:
+            r = requests.get(f"{MB_API}{path}", params={**params, "fmt": "json"},
+                             headers={"User-Agent": MB_UA}, timeout=25)
+        except requests.RequestException:
+            return None, "MusicBrainz unreachable (network error)"
+        if r.status_code in (429, 503):
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 404:
+            return None, "not found"
+        if not r.ok:
+            return None, f"MusicBrainz HTTP {r.status_code}"
+        try:
+            return r.json(), "ok"
+        except ValueError:
+            return None, "MusicBrainz bad response"
+    return None, "MusicBrainz rate-limited, try again later"
 
 
 def _add(bucket: list[str], name: str | None, role: str | None = None) -> None:
@@ -173,26 +187,51 @@ def _add(bucket: list[str], name: str | None, role: str | None = None) -> None:
         bucket.append(entry)
 
 
-def lookup_credits(isrc: str | None) -> dict[str, str]:
-    """Composition, lyrics, production and engineering credits from MusicBrainz."""
-    empty = {k: "" for k in CREDIT_KEYS}
-    if not isrc:
-        return empty
-    if isrc in _mb_cache:
-        return _mb_cache[isrc]
+def _clean_title(title: str) -> str:
+    t = re.sub(r"\s*[\(\[].*?[\)\]]", "", title or "")   # (feat. X), [Remastered]
+    t = re.sub(r"\s+-\s+.*$", "", t)                       # " - Remastered 2011"
+    return t.replace('"', " ").replace("\\", " ").strip()
+
+
+def _find_recordings(isrc: str | None, artist: str, title: str) -> tuple[list[str], str]:
+    err = ""
+    if isrc:
+        data, st = _mb_get(f"/isrc/{isrc}", {})
+        ids = [r["id"] for r in (data or {}).get("recordings", [])][:5]
+        if ids:
+            return ids, "ok"
+        err = st if st not in ("ok", "not found") else ""
+    t = _clean_title(title)
+    if t and artist:
+        q = f'recording:"{t}" AND artist:"{artist.replace(chr(34), " ")}"'
+        data, st = _mb_get("/recording", {"query": q, "limit": 5})
+        ids = [r["id"] for r in (data or {}).get("recordings", []) if r.get("score", 0) >= 90][:3]
+        if ids:
+            return ids, "ok"
+        err = err or (st if st != "ok" else "")
+    return [], err or "not found in MusicBrainz"
+
+
+def lookup_credits(isrc: str | None, artist: str = "", title: str = "") -> tuple[dict[str, str], str]:
+    """Composition, lyrics, production and engineering credits + a status text."""
+    key = isrc or f"{artist}|{title}"
+    if key in _mb_cache:
+        return _mb_cache[key]
     buckets: dict[str, list[str]] = {k: [] for k in CREDIT_KEYS}
-    hit = _mb_get(f"/isrc/{isrc}", {})
-    for rec in (hit or {}).get("recordings", [])[:1]:
-        full = _mb_get(f"/recording/{rec['id']}",
-                       {"inc": "artist-rels+work-rels+work-level-rels"}) or {}
-        for rel in full.get("relations", []):
+    ids, status = _find_recordings(isrc, artist, title)
+    errors = []
+    for rid in ids:
+        full, st = _mb_get(f"/recording/{rid}", {"inc": _INC})
+        if st != "ok":
+            errors.append(st)
+            continue
+        for rel in (full or {}).get("relations", []):
             t = (rel.get("type") or "").lower()
             name = (rel.get("artist") or {}).get("name")
             if t in _PRODUCTION:
                 _add(buckets["production"], name)
             elif t in _ENGINEERING:
                 _add(buckets["engineering"], name, None if t == "engineer" else t)
-            # work-level credits (songwriting)
             for r2 in (rel.get("work") or {}).get("relations", []):
                 t2 = (r2.get("type") or "").lower()
                 n2 = (r2.get("artist") or {}).get("name")
@@ -201,8 +240,15 @@ def lookup_credits(isrc: str | None) -> dict[str, str]:
                 elif t2 in _COMPOSITION:
                     _add(buckets["composition"], n2, None if t2 in ("composer", "writer") else t2)
     out = {k: "; ".join(v) for k, v in buckets.items()}
-    _mb_cache[isrc] = out
-    return out
+    if not ids:
+        status = status
+    elif any(out.values()):
+        missing = [k for k, v in out.items() if not v]
+        status = "ok" if not missing else "partial (none on record: " + ", ".join(missing) + ")"
+    else:
+        status = errors[0] if errors else "recording found, but no credits entered in MusicBrainz"
+    _mb_cache[key] = (out, status)
+    return out, status
 
 
 # ---- row building ----------------------------------------------------------
@@ -232,7 +278,10 @@ def build_row(client: SpotifyClient, track: dict, credits: bool = False) -> dict
     artists = [a.get("name", "") for a in track.get("artists") or []]
     rel, prec, year = _release(album)
     cps = album.get("copyrights") or []
-    cr = lookup_credits(isrc) if credits else {k: "" for k in CREDIT_KEYS}
+    if credits:
+        cr, cr_status = lookup_credits(isrc, artists[0] if artists else "", track.get("name", ""))
+    else:
+        cr, cr_status = {k: "" for k in CREDIT_KEYS}, "not requested"
 
     def join(kind: str) -> str:
         return " | ".join(c.get("text", "") for c in cps if c.get("type") == kind)
@@ -253,6 +302,7 @@ def build_row(client: SpotifyClient, track: dict, credits: bool = False) -> dict
         "Lyrics (Lyricist)": cr["lyrics"],
         "Production (Producer)": cr["production"],
         "Engineering (Recording/Mix/Mastering)": cr["engineering"],
+        "Credits Status": cr_status,
         "Explicit": bool(track.get("explicit", False)),
         "Spotify URI": track.get("uri", ""),
     }

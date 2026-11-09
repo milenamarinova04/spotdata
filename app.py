@@ -14,7 +14,7 @@ with st.sidebar:
     st.header("Spotify credentials")
     cid = st.text_input("Client ID", value=os.getenv("SPOTIFY_CLIENT_ID", ""))
     secret = st.text_input("Client Secret", value=os.getenv("SPOTIFY_CLIENT_SECRET", ""), type="password")
-    credits = st.checkbox("Composition, lyrics, production & engineering credits (MusicBrainz, slow ~2-3 s/track)")
+    credits = st.checkbox("Composition, lyrics, production & engineering credits (MusicBrainz, slow ~2-3 s/track)", value=True)
     st.caption("These credits are not in the Spotify API; MusicBrainz coverage is partial.")
 
 links = st.text_area("Spotify URLs or URIs (one per line)", height=120,
