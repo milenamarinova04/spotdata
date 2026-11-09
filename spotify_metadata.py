@@ -152,7 +152,7 @@ _mb_cache: dict[str, tuple[dict[str, str], str]] = {}
 _mb_last = 0.0
 
 
-def _mb_get(path: str, params: dict, retries: int = 3) -> tuple[dict | None, str]:
+def _mb_get(path: str, params: dict, retries: int = 4) -> tuple[dict | None, str]:
     """GET from MusicBrainz. Returns (json_or_None, status)."""
     global _mb_last
     for attempt in range(retries):
@@ -164,7 +164,10 @@ def _mb_get(path: str, params: dict, retries: int = 3) -> tuple[dict | None, str
             r = requests.get(f"{MB_API}{path}", params={**params, "fmt": "json"},
                              headers={"User-Agent": MB_UA}, timeout=25)
         except requests.RequestException:
-            return None, "MusicBrainz unreachable (network error)"
+            if attempt == retries - 1:
+                return None, "MusicBrainz unreachable (network error)"
+            time.sleep(3 * (attempt + 1))   # connection dropped: back off and retry
+            continue
         if r.status_code in (429, 503):
             time.sleep(2 * (attempt + 1))
             continue
@@ -309,7 +312,7 @@ def build_row(client: SpotifyClient, track: dict, credits: bool = False) -> dict
 
 
 def extract(client: SpotifyClient, link: str, credits: bool = False,
-            progress=None) -> tuple[pd.DataFrame, list[str]]:
+            progress=None, limit: int = 0) -> tuple[pd.DataFrame, list[str]]:
     """Return (DataFrame, warnings) for one URL/URI."""
     kind, sid = parse_spotify_link(link)
     warnings: list[str] = []
@@ -321,6 +324,9 @@ def extract(client: SpotifyClient, link: str, credits: bool = False,
         tracks = [dict(t, album={"id": sid}) for t in client._paginate(alb["tracks"])]
     else:
         tracks = list(client.playlist_tracks(sid))
+
+    if limit and limit > 0:
+        tracks = tracks[:limit]
 
     rows = []
     for i, t in enumerate(tracks, 1):
@@ -345,6 +351,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("links", nargs="+")
     ap.add_argument("-o", "--out", default="spotify_metadata.csv", help=".csv or .xlsx")
+    ap.add_argument("--limit", type=int, default=0, help="only the first N tracks per link (0 = all)")
     ap.add_argument("--credits", "--writers", dest="credits", action="store_true",
                     help="look up composition/lyrics/production/engineering credits via MusicBrainz (slow)")
     a = ap.parse_args()
@@ -353,7 +360,7 @@ def main() -> int:
         frames = []
         for link in a.links:
             try:
-                df, warns = extract(client, link, a.credits)
+                df, warns = extract(client, link, a.credits, limit=a.limit)
                 frames.append(df)
                 for w in warns:
                     print(f"warning: {w}", file=sys.stderr)

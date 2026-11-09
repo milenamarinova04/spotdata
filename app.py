@@ -16,6 +16,7 @@ with st.sidebar:
     secret = st.text_input("Client Secret", value=os.getenv("SPOTIFY_CLIENT_SECRET", ""), type="password")
     credits = st.checkbox("Composition, lyrics, production & engineering credits (MusicBrainz, slow ~2-3 s/track)", value=True)
     st.caption("These credits are not in the Spotify API; MusicBrainz coverage is partial.")
+    limit = st.number_input("Only the first N tracks per link (0 = all)", min_value=0, value=2, step=1)
 
 links = st.text_area("Spotify URLs or URIs (one per line)", height=120,
                      placeholder="https://open.spotify.com/album/...\nspotify:track:...")
@@ -35,7 +36,8 @@ if st.button("Extract", type="primary"):
     for n, link in enumerate(lines):
         try:
             df, warns = extract(client, link, credits,
-                                progress=lambda p, n=n: bar.progress((n + p) / len(lines)))
+                                progress=lambda p, n=n: bar.progress((n + p) / len(lines)),
+                                limit=int(limit))
             frames.append(df)
             for w in warns:
                 st.warning(w)
