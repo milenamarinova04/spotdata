@@ -3,12 +3,12 @@ Spotify metadata extractor (Client Credentials flow, plain `requests`).
 
 CLI:
     export SPOTIFY_CLIENT_ID=...  SPOTIFY_CLIENT_SECRET=...
-    python spotify_metadata.py <url-or-uri> [more ...] -o out.csv|out.xlsx [--writers]
+    python spotify_metadata.py <url-or-uri> [more ...] -o out.csv|out.xlsx [--credits]
 
 Notes
-- Songwriter/composer credits are NOT exposed by the Spotify Web API. With
-  --writers they are looked up on MusicBrainz via the track's ISRC (free, no key,
-  rate-limited to ~1 req/s, coverage is incomplete).
+- Composition, lyrics, production and engineering credits are NOT exposed by the
+  Spotify Web API. With --credits they are looked up on MusicBrainz via the
+  track's ISRC (free, no key, ~1 req/s, ~2 requests per track, coverage is partial).
 - Batch endpoints (GET /tracks, /albums) were removed for Development Mode apps
   in 2026, so everything is fetched one ID at a time and cached.
 """
@@ -33,7 +33,10 @@ COLUMNS = [
     "Primary Artist", "Featured Artists", "Track Title", "Album",
     "Release Date", "Release Date Precision", "Release Year",
     "Copyright (C)", "Phonographic Copyright (P)",
-    "ISRC", "UPC", "Writers / Composers", "Explicit", "Spotify URI",
+    "ISRC", "UPC",
+    "Composition (Composer/Writer)", "Lyrics (Lyricist)",
+    "Production (Producer)", "Engineering (Recording/Mix/Mastering)",
+    "Explicit", "Spotify URI",
 ]
 
 _URL_RE = re.compile(
@@ -137,8 +140,14 @@ class SpotifyClient:
             yield it.get("item") or it.get("track") or {}
 
 
-# ---- MusicBrainz writer lookup (optional) ---------------------------------
-_mb_cache: dict[str, str] = {}
+# ---- MusicBrainz credits lookup (optional) ---------------------------------
+CREDIT_KEYS = ["composition", "lyrics", "production", "engineering"]
+_COMPOSITION = {"composer", "writer", "arranger", "orchestrator"}
+_LYRICS = {"lyricist", "librettist"}
+_PRODUCTION = {"producer", "co-producer", "executive producer", "vocal producer"}
+_ENGINEERING = {"engineer", "recording", "mix", "mixer", "mastering", "sound",
+                "audio", "balance", "programming", "field recording"}
+_mb_cache: dict[str, dict[str, str]] = {}
 _mb_last = 0.0
 
 
@@ -156,23 +165,44 @@ def _mb_get(path: str, params: dict) -> dict | None:
         return None
 
 
-def lookup_writers(isrc: str | None) -> str:
+def _add(bucket: list[str], name: str | None, role: str | None = None) -> None:
+    if not name:
+        return
+    entry = f"{name} ({role})" if role else name
+    if entry not in bucket:
+        bucket.append(entry)
+
+
+def lookup_credits(isrc: str | None) -> dict[str, str]:
+    """Composition, lyrics, production and engineering credits from MusicBrainz."""
+    empty = {k: "" for k in CREDIT_KEYS}
     if not isrc:
-        return ""
+        return empty
     if isrc in _mb_cache:
         return _mb_cache[isrc]
-    names: list[str] = []
+    buckets: dict[str, list[str]] = {k: [] for k in CREDIT_KEYS}
     hit = _mb_get(f"/isrc/{isrc}", {})
     for rec in (hit or {}).get("recordings", [])[:1]:
-        full = _mb_get(f"/recording/{rec['id']}", {"inc": "work-rels+work-level-rels"})
-        for rel in (full or {}).get("relations", []):
+        full = _mb_get(f"/recording/{rec['id']}",
+                       {"inc": "artist-rels+work-rels+work-level-rels"}) or {}
+        for rel in full.get("relations", []):
+            t = (rel.get("type") or "").lower()
+            name = (rel.get("artist") or {}).get("name")
+            if t in _PRODUCTION:
+                _add(buckets["production"], name)
+            elif t in _ENGINEERING:
+                _add(buckets["engineering"], name, None if t == "engineer" else t)
+            # work-level credits (songwriting)
             for r2 in (rel.get("work") or {}).get("relations", []):
-                if r2.get("type") in ("composer", "lyricist", "writer"):
-                    n = (r2.get("artist") or {}).get("name")
-                    if n and n not in names:
-                        names.append(n)
-    _mb_cache[isrc] = "; ".join(names)
-    return _mb_cache[isrc]
+                t2 = (r2.get("type") or "").lower()
+                n2 = (r2.get("artist") or {}).get("name")
+                if t2 in _LYRICS:
+                    _add(buckets["lyrics"], n2)
+                elif t2 in _COMPOSITION:
+                    _add(buckets["composition"], n2, None if t2 in ("composer", "writer") else t2)
+    out = {k: "; ".join(v) for k, v in buckets.items()}
+    _mb_cache[isrc] = out
+    return out
 
 
 # ---- row building ----------------------------------------------------------
@@ -187,7 +217,7 @@ def _release(album: dict) -> tuple[str, str, str]:
     return full, prec, raw[:4]
 
 
-def build_row(client: SpotifyClient, track: dict, writers: bool = False) -> dict | None:
+def build_row(client: SpotifyClient, track: dict, credits: bool = False) -> dict | None:
     tid = track.get("id")
     if not tid or track.get("type", "track") != "track":
         return None  # local file, episode or removed item
@@ -202,6 +232,7 @@ def build_row(client: SpotifyClient, track: dict, writers: bool = False) -> dict
     artists = [a.get("name", "") for a in track.get("artists") or []]
     rel, prec, year = _release(album)
     cps = album.get("copyrights") or []
+    cr = lookup_credits(isrc) if credits else {k: "" for k in CREDIT_KEYS}
 
     def join(kind: str) -> str:
         return " | ".join(c.get("text", "") for c in cps if c.get("type") == kind)
@@ -218,13 +249,16 @@ def build_row(client: SpotifyClient, track: dict, writers: bool = False) -> dict
         "Phonographic Copyright (P)": join("P"),
         "ISRC": isrc,
         "UPC": (album.get("external_ids") or {}).get("upc") or (album.get("external_ids") or {}).get("ean"),
-        "Writers / Composers": lookup_writers(isrc) if writers else "",
+        "Composition (Composer/Writer)": cr["composition"],
+        "Lyrics (Lyricist)": cr["lyrics"],
+        "Production (Producer)": cr["production"],
+        "Engineering (Recording/Mix/Mastering)": cr["engineering"],
         "Explicit": bool(track.get("explicit", False)),
         "Spotify URI": track.get("uri", ""),
     }
 
 
-def extract(client: SpotifyClient, link: str, writers: bool = False,
+def extract(client: SpotifyClient, link: str, credits: bool = False,
             progress=None) -> tuple[pd.DataFrame, list[str]]:
     """Return (DataFrame, warnings) for one URL/URI."""
     kind, sid = parse_spotify_link(link)
@@ -241,7 +275,7 @@ def extract(client: SpotifyClient, link: str, writers: bool = False,
     rows = []
     for i, t in enumerate(tracks, 1):
         try:
-            row = build_row(client, t, writers)
+            row = build_row(client, t, credits)
         except SpotifyError as e:
             warnings.append(f"Track {t.get('name') or t.get('id')}: {e}")
             continue
@@ -261,14 +295,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("links", nargs="+")
     ap.add_argument("-o", "--out", default="spotify_metadata.csv", help=".csv or .xlsx")
-    ap.add_argument("--writers", action="store_true", help="look up writers via MusicBrainz (slow)")
+    ap.add_argument("--credits", "--writers", dest="credits", action="store_true",
+                    help="look up composition/lyrics/production/engineering credits via MusicBrainz (slow)")
     a = ap.parse_args()
     try:
         client = SpotifyClient(os.getenv("SPOTIFY_CLIENT_ID", ""), os.getenv("SPOTIFY_CLIENT_SECRET", ""))
         frames = []
         for link in a.links:
             try:
-                df, warns = extract(client, link, a.writers)
+                df, warns = extract(client, link, a.credits)
                 frames.append(df)
                 for w in warns:
                     print(f"warning: {w}", file=sys.stderr)
